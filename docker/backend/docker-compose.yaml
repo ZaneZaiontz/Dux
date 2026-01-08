@@ -1,0 +1,46 @@
+---
+name: dux_backend
+services:
+  dux_backend:
+    image: dux_backend:0.0.1
+    container_name: dux_backend
+    restart: always
+    working_dir: /app/backend
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - python3
+      - server.py
+    ports:
+      - ${BACKEND_PORT:-8000}:${BACKEND_PORT:-8000}
+    volumes:
+      - ../../app/backend:/app/backend
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${BACKEND_PORT:-8000}/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+  postgres:
+    image: postgres:18.1
+    container_name: dux_postgres
+    restart: always
+    ports:
+      - ${POSTGRES_PORT:-5432}:${POSTGRES_PORT:-5432}
+    volumes:
+      - ${POSTGRES_DATA_DIR}:/var/lib/postgresql
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-dux}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-dux}
+      - POSTGRES_DB=${POSTGRES_DB:-dux}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
