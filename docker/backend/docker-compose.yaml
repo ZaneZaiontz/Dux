@@ -26,21 +26,22 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
-  postgres:
-    image: postgres:18.1
-    container_name: dux_postgres
-    restart: always
-    ports:
-      - ${POSTGRES_PORT:-5432}:${POSTGRES_PORT:-5432}
-    volumes:
-      - ${POSTGRES_DATA_DIR}:/var/lib/postgresql
-    environment:
-      - POSTGRES_USER=${POSTGRES_USER:-dux}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-dux}
-      - POSTGRES_DB=${POSTGRES_DB:-dux}
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
+  # Commenting out postgres until we need it
+  # postgres:
+  #   image: postgres:18.1
+  #   container_name: dux_postgres
+  #   restart: always
+  #   ports:
+  #     - ${POSTGRES_PORT:-5432}:${POSTGRES_PORT:-5432}
+  #   volumes:
+  #     - ${POSTGRES_DATA_DIR}:/var/lib/postgresql
+  #   environment:
+  #     - POSTGRES_USER=${POSTGRES_USER:-dux}
+  #     - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-dux}
+  #     - POSTGRES_DB=${POSTGRES_DB:-dux}
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #     start_period: 30s

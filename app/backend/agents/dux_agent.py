@@ -64,5 +64,7 @@ class DuxAgent:
         Returns:
             The generated output from the LLM
         """
-        result = await self.graph.ainvoke({"user_input": user_input, "output": ""})
+        result = await self.graph.ainvoke(
+            {"user_input": user_input, "output": ""}
+        )
         return result["output"]
