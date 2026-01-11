@@ -1,0 +1,31 @@
+[MAIN]
+py-version=3.11
+
+[MESSAGES CONTROL]
+disable=
+    too-few-public-methods,
+    import-error
+
+[FORMAT]
+max-line-length=80
+indent-string='    '
+
+[NAMING]
+function-naming-style=snake_case
+variable-naming-style=snake_case
+class-naming-style=PascalCase
+const-naming-style=UPPER_CASE
+argument-naming-style=snake_case
+attr-naming-style=snake_case
+method-naming-style=snake_case
+module-naming-style=snake_case
+
+[DESIGN]
+max-args=6
+max-locals=15
+max-returns=6
+max-branches=12
+max-statements=50
+
+[BASIC]
+good-names=i,j,k,e,f,_,id,db,ok,app,sio

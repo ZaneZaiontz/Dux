@@ -1,0 +1,15 @@
+---
+name: dux
+
+services:
+  # TODO
+  db:
+    image: postgres:15
+    ports:
+      - 5432:5432
+    environment:
+      POSTGRES_USER: dux
+      POSTGRES_PASSWORD: dux
+      POSTGRES_DB: dux
+    volumes:
+      - db_data:/var/lib/postgresql/data
