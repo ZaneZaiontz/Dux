@@ -20,28 +20,33 @@ services:
       - .env
     environment:
       - PYTHONUNBUFFERED=1
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${BACKEND_PORT:-8000}/health"]
       interval: 15s
       timeout: 5s
       retries: 3
       start_period: 15s
-  # Commenting out postgres until we need it
-  # postgres:
-  #   image: postgres:18.1
-  #   container_name: dux_postgres
-  #   restart: always
-  #   ports:
-  #     - ${POSTGRES_PORT:-5432}:${POSTGRES_PORT:-5432}
-  #   volumes:
-  #     - ${POSTGRES_DATA_DIR}:/var/lib/postgresql
-  #   environment:
-  #     - POSTGRES_USER=${POSTGRES_USER:-dux}
-  #     - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-dux}
-  #     - POSTGRES_DB=${POSTGRES_DB:-dux}
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 5
-  #     start_period: 30s
+  postgres:
+    image: pgvector/pgvector:pg18
+    container_name: dux_postgres
+    restart: always
+    ports:
+      - ${POSTGRES_PORT:-5432}:5432
+    volumes:
+      - dux_postgres_data:/var/lib/postgresql
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-dux}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-dux}
+      - POSTGRES_DB=${POSTGRES_DB:-dux}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dux}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  dux_postgres_data:

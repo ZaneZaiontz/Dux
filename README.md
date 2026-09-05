@@ -10,6 +10,8 @@ Once docker is installed and functioning, navigate from the project root directo
 
 Once that's done, you can run the project by using the script in /docker/backend/ `./start.sh` or from that folder location you can run `docker compose up`
 
+This starts a Postgres database alongside the backend. Your conversations are stored there, so Dux remembers where you left off after a restart.
+
 ## Testing Dux
 
 To test to make sure Dux is working, you can use a provided script to hit the server and ask questions. 

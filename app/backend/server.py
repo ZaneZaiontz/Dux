@@ -10,7 +10,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
 
-from agents.dux_agent import DuxAgent
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+from agents.dux_agent import DuxAgent, build_gemini
+from data.database import connection_string
 
 sio = socketio.AsyncServer(cors_allowed_origins="*", async_mode="asgi")
 
@@ -19,6 +22,7 @@ class GenerateRequest(BaseModel):
     """Request model for the generate endpoint"""
 
     user_input: str
+    conversation_id: str
 
 
 class GenerateResponse(BaseModel):
@@ -41,9 +45,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         None during the application's active period
     """
     global agent
-    agent = DuxAgent()
-    yield
-    agent = None
+    async with AsyncPostgresSaver.from_conn_string(
+        connection_string()
+    ) as checkpointer:
+        await checkpointer.setup()
+        agent = DuxAgent(llm=build_gemini(), checkpointer=checkpointer)
+        yield
+        agent = None
 
 
 app = FastAPI(lifespan=lifespan)
@@ -85,7 +93,9 @@ async def generate(request: GenerateRequest) -> GenerateResponse:
     if agent is None:
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
-    output = await agent.generate(request.user_input)
+    output = await agent.generate(
+        request.user_input, request.conversation_id
+    )
     return GenerateResponse(output=output)
 
 
