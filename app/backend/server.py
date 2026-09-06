@@ -14,6 +14,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from agents.dux_agent import DuxAgent, build_gemini
 from data.database import connection_string
+from workspace.tools import build_workspace_tools
 
 sio = socketio.AsyncServer(cors_allowed_origins="*", async_mode="asgi")
 
@@ -49,7 +50,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         connection_string()
     ) as checkpointer:
         await checkpointer.setup()
-        agent = DuxAgent(llm=build_gemini(), checkpointer=checkpointer)
+        agent = DuxAgent(
+            llm=build_gemini(),
+            checkpointer=checkpointer,
+            tools=build_workspace_tools(),
+        )
         yield
         agent = None
 

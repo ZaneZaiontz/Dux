@@ -4,49 +4,11 @@ import pytest
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from agents.dux_agent import DuxAgent, route_entry, route_verdict
+from agents.dux_agent import (MAX_TOOL_CALLS, DuxAgent, route_entry,
+                              route_verdict)
 from data.database import connection_string
-
-
-def test_route_entry_hypothesizes_when_no_hypothesis_yet():
-    state = {"hypothesis": "", "verdict": "", "revised_this_turn": False}
-    assert route_entry(state) == "hypothesize"
-
-
-def test_route_entry_assesses_when_hypothesis_exists():
-    state = {"hypothesis": "Missing await", "verdict": "",
-             "revised_this_turn": False}
-    assert route_entry(state) == "assess"
-
-
-def test_route_verdict_affirms_when_user_arrived():
-    state = {"hypothesis": "Missing await", "verdict": "arrived",
-             "revised_this_turn": False}
-    assert route_verdict(state) == "affirm"
-
-
-def test_route_verdict_probes_when_user_is_warm():
-    state = {"hypothesis": "Missing await", "verdict": "warm",
-             "revised_this_turn": False}
-    assert route_verdict(state) == "probe"
-
-
-def test_route_verdict_probes_when_user_is_off_track():
-    state = {"hypothesis": "Missing await", "verdict": "off_track",
-             "revised_this_turn": False}
-    assert route_verdict(state) == "probe"
-
-
-def test_route_verdict_rebuilds_hypothesis_when_problem_changed():
-    state = {"hypothesis": "Missing await", "verdict": "problem_changed",
-             "revised_this_turn": False}
-    assert route_verdict(state) == "hypothesize"
-
-
-def test_route_verdict_stops_rebuilding_after_one_revision():
-    state = {"hypothesis": "Missing await", "verdict": "problem_changed",
-             "revised_this_turn": True}
-    assert route_verdict(state) == "probe"
+from workspace.sandbox import Workspace
+from workspace.tools import build_tools
 
 
 class StubStructured:
@@ -62,7 +24,7 @@ class StubStructured:
 
 
 class StubLLM:
-    """LLM stand-in that returns queued text without calling a provider"""
+    """LLM stand-in that returns queued replies without calling a provider"""
 
     def __init__(self, texts, verdicts=None):
         self.texts = list(texts)
@@ -70,48 +32,81 @@ class StubLLM:
 
     async def ainvoke(self, _messages):
         """Return the next queued reply"""
-        return AIMessage(content=self.texts.pop(0))
+        queued = self.texts.pop(0)
+        return queued if isinstance(queued, AIMessage) else AIMessage(
+            content=queued
+        )
 
     def with_structured_output(self, schema):
         """Return a stub that produces assessments of the given schema"""
         return StubStructured(schema, self.verdicts)
 
-
-def build_agent(stub):
-    return DuxAgent(llm=stub, checkpointer=InMemorySaver())
-
-
-@pytest.mark.asyncio
-async def test_first_turn_keeps_the_hypothesis_out_of_the_reply():
-    stub = StubLLM(["It is a missing await", "What does the call return?"],
-                   ["off_track"])
-    agent = build_agent(stub)
-
-    reply = await agent.generate("my function returns a coroutine", "t1")
-
-    assert reply == "What does the call return?"
-    assert "missing await" not in reply
+    def bind_tools(self, _tools):
+        """Return the same stub, since queued replies already decide calls"""
+        return self
 
 
-@pytest.mark.asyncio
-async def test_first_turn_stores_the_hypothesis_in_state():
-    stub = StubLLM(["It is a missing await", "What does the call return?"],
-                   ["off_track"])
-    agent = build_agent(stub)
-
-    await agent.generate("my function returns a coroutine", "t1")
-    state = await agent.graph.aget_state(
-        {"configurable": {"thread_id": "t1"}}
+def tool_call(name, args):
+    """Build a model reply that asks for one tool call"""
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": name, "args": args, "id": f"call-{name}"}],
     )
 
+
+async def state_after(agent, *turns):
+    """Run turns through one conversation and return the resulting state"""
+    for turn in turns:
+        await agent.generate(turn, "t1")
+    return await agent.graph.aget_state({"configurable": {"thread_id": "t1"}})
+
+
+@pytest.fixture(name="project_tools")
+def project_tools_fixture(tmp_path):
+    (tmp_path / "main.py").write_text("def run():\n    return fetch()\n")
+    return build_tools(Workspace(tmp_path))
+
+
+@pytest.mark.parametrize("hypothesis,expected", [
+    ("", "hypothesize"),
+    ("Missing await", "assess"),
+])
+def test_route_entry_hypothesizes_only_when_needed(hypothesis, expected):
+    assert route_entry({"hypothesis": hypothesis}) == expected
+
+
+@pytest.mark.parametrize("verdict,revised,expected", [
+    ("arrived", False, "affirm"),
+    ("warm", False, "probe"),
+    ("off_track", False, "probe"),
+    ("problem_changed", False, "hypothesize"),
+    ("problem_changed", True, "probe"),
+])
+def test_route_verdict_picks_the_reply_and_guards_the_rebuild(
+    verdict, revised, expected
+):
+    state = {"verdict": verdict, "revised_this_turn": revised}
+
+    assert route_verdict(state) == expected
+
+
+@pytest.mark.asyncio
+async def test_the_hypothesis_is_stored_but_never_shown():
+    stub = StubLLM(["It is a missing await", "What does the call return?"],
+                   ["off_track"])
+    agent = DuxAgent(llm=stub, checkpointer=InMemorySaver())
+
+    state = await state_after(agent, "my function returns a coroutine")
+
     assert state.values["hypothesis"] == "It is a missing await"
+    assert "missing await" not in state.values["messages"][-1].content
 
 
 @pytest.mark.asyncio
 async def test_arriving_at_the_answer_returns_the_affirming_reply():
     stub = StubLLM(["It is a missing await", "Yes, that is exactly it"],
                    ["arrived"])
-    agent = build_agent(stub)
+    agent = DuxAgent(llm=stub, checkpointer=InMemorySaver())
 
     reply = await agent.generate("I never awaited it", "t1")
 
@@ -119,20 +114,54 @@ async def test_arriving_at_the_answer_returns_the_affirming_reply():
 
 
 @pytest.mark.asyncio
-async def test_second_turn_reuses_the_stored_hypothesis():
+async def test_the_second_turn_reuses_the_stored_hypothesis():
     stub = StubLLM(
         ["It is a missing await", "What does the call return?",
          "So what would await change?"],
         ["off_track", "warm"],
     )
-    agent = build_agent(stub)
+    agent = DuxAgent(llm=stub, checkpointer=InMemorySaver())
 
-    first = await agent.generate("my function returns a coroutine", "t1")
-    second = await agent.generate("it returns something weird", "t1")
+    state = await state_after(agent, "returns a coroutine", "something weird")
 
-    assert [first, second] == ["What does the call return?",
-                               "So what would await change?"]
+    assert state.values["messages"][-1].content == "So what would await change?"
     assert not stub.texts
+
+
+@pytest.mark.asyncio
+async def test_code_is_read_for_the_hypothesis_but_kept_out_of_the_chat(
+    project_tools
+):
+    stub = StubLLM(
+        [tool_call("read_file", {"path": "main.py"}),
+         "run forgets to await fetch",
+         "What does fetch return?"],
+        ["off_track"],
+    )
+    agent = DuxAgent(llm=stub, checkpointer=InMemorySaver(),
+                     tools=project_tools)
+
+    state = await state_after(agent, "my function returns the wrong thing")
+
+    assert state.values["hypothesis"] == "run forgets to await fetch"
+    assert "return fetch()" in str(state.values["research"])
+    assert "return fetch()" not in str(state.values["messages"])
+
+
+@pytest.mark.asyncio
+async def test_investigation_stops_at_the_tool_call_cap(project_tools):
+    stub = StubLLM(
+        [tool_call("list_files", {}) for _ in range(MAX_TOOL_CALLS)]
+        + ["giving up, likely a missing await", "What does fetch return?"],
+        ["off_track"],
+    )
+    agent = DuxAgent(llm=stub, checkpointer=InMemorySaver(),
+                     tools=project_tools)
+
+    state = await state_after(agent, "my function returns the wrong thing")
+
+    assert state.values["tool_calls_used"] == MAX_TOOL_CALLS
+    assert state.values["hypothesis"] == "giving up, likely a missing await"
 
 
 def test_connection_string_uses_the_configured_environment(monkeypatch):

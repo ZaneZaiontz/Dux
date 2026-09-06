@@ -12,6 +12,15 @@ Once that's done, you can run the project by using the script in /docker/backend
 
 This starts a Postgres database alongside the backend. Your conversations are stored there, so Dux remembers where you left off after a restart.
 
+## Pointing Dux at your code
+
+Dux answers better when it can read the project you are stuck on. Set `DUX_WORKSPACE`
+in your `.env` to the folder you want it to read, then restart. It defaults to the Dux
+project itself, so it works out of the box.
+
+The folder is mounted read-only, and Dux will not open secrets such as `.env` files or
+keys, anything your `.gitignore` covers, or dependency folders like `node_modules`.
+
 ## Testing Dux
 
 To test to make sure Dux is working, you can use a provided script to hit the server and ask questions. 

@@ -6,3 +6,5 @@ python-socketio==5.16.0
 uvicorn==0.40.0
 langgraph-checkpoint-postgres==3.0.5
 psycopg[binary,pool]==3.3.5
+langgraph-prebuilt==1.0.5
+pathspec==1.1.1
