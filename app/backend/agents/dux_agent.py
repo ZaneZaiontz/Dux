@@ -1,70 +1,200 @@
-"""Basic LangGraph agent for handling LLM generation"""
+"""LangGraph agent that guides a developer toward their own answer"""
 
 import os
-from typing import TypedDict
+from typing import Annotated, Literal, TypedDict
 
-from langgraph.graph import StateGraph, START, END
-# from langchain_openai import ChatOpenAI
+from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from pydantic import BaseModel, Field
+
+from prompts.dux_prompts_base import DuxPromptsBase
+
+Verdict = Literal["off_track", "warm", "arrived", "problem_changed"]
+
+
+class Assessment(BaseModel):
+    """How close the developer's latest turn came to the hypothesis"""
+
+    verdict: Verdict = Field(description="How close the developer is")
+    reason: str = Field(description="One line explaining the verdict")
 
 
 class AgentState(TypedDict):
     """State definition for the agent graph"""
 
-    user_input: str
-    output: str
+    messages: Annotated[list[AnyMessage], add_messages]
+    hypothesis: str
+    verdict: str
+    revised_this_turn: bool
+
+
+def route_entry(state: AgentState) -> str:
+    """Pick the first node of a turn based on whether a hypothesis exists
+
+    Args:
+        state: The current agent state
+
+    Returns:
+        The name of the node to run first
+    """
+    return "hypothesize" if not state.get("hypothesis") else "assess"
+
+
+def route_verdict(state: AgentState) -> str:
+    """Pick the reply node, allowing one hypothesis rebuild per turn
+
+    Args:
+        state: The current agent state
+
+    Returns:
+        The name of the node to run next
+    """
+    if state["verdict"] == "arrived":
+        return "affirm"
+    if state["verdict"] == "problem_changed" and not state["revised_this_turn"]:
+        return "hypothesize"
+    return "probe"
+
+
+def build_gemini(
+    model_name: str = "gemini-2.5-flash",
+) -> ChatGoogleGenerativeAI:
+    """Build the Gemini chat model used in production
+
+    Args:
+        model_name: The name of the model to use
+
+    Returns:
+        A configured Gemini chat model
+    """
+    return ChatGoogleGenerativeAI(
+        model=model_name,
+        google_api_key=os.environ.get("GEMINI_KEY"),
+    )
 
 
 class DuxAgent:
-    """Agent that processes user input through an LLM using LangGraph"""
+    """Agent that guides a developer to their own answer through questions"""
 
-    def __init__(self, model_name: str = "gemini-2.5-flash") -> None:
-        """Initialize the agent with an LLM and compiled graph
+    def __init__(self, llm, checkpointer) -> None:
+        """Initialize the agent with a chat model and a checkpointer
 
         Args:
-            model_name: The name of the model to use
+            llm: The chat model used by every node
+            checkpointer: The LangGraph checkpointer holding thread history
         """
-        # self.llm = ChatOpenAI(model=model_name)
-        self.llm = ChatGoogleGenerativeAI(
-            model=model_name,
-            google_api_key=os.environ.get("GEMINI_KEY"),
-        )
-        self.graph = self._build_graph()
+        self.llm = llm
+        self.graph = self._build_graph(checkpointer)
 
-    def _build_graph(self) -> StateGraph:
+    def _build_graph(self, checkpointer):
         """Build and compile the LangGraph workflow
+
+        Args:
+            checkpointer: The LangGraph checkpointer holding thread history
 
         Returns:
             The compiled state graph
         """
         graph = StateGraph(AgentState)
-        graph.add_node("generate", self._generate_node)
-        graph.add_edge(START, "generate")
-        graph.add_edge("generate", END)
-        return graph.compile()
+        graph.add_node("hypothesize", self._hypothesize_node)
+        graph.add_node("assess", self._assess_node)
+        graph.add_node("probe", self._probe_node)
+        graph.add_node("affirm", self._affirm_node)
+        graph.add_conditional_edges(START, route_entry,
+                                    ["hypothesize", "assess"])
+        graph.add_edge("hypothesize", "assess")
+        graph.add_conditional_edges("assess", route_verdict,
+                                    ["probe", "affirm", "hypothesize"])
+        graph.add_edge("probe", END)
+        graph.add_edge("affirm", END)
+        return graph.compile(checkpointer=checkpointer)
 
-    async def _generate_node(self, state: AgentState) -> dict[str, str]:
-        """Process user input through the LLM
+    async def _hypothesize_node(self, state: AgentState) -> dict:
+        """Form the private answer Dux will guide the developer toward
 
         Args:
-            state: The current agent state containing user input
+            state: The current agent state
 
         Returns:
-            Dictionary with the generated output
+            The new hypothesis and the guard against rebuilding it again
         """
-        response = await self.llm.ainvoke(state["user_input"])
-        return {"output": response.content}
+        prompt = [SystemMessage(DuxPromptsBase.hypothesize_prompt)]
+        response = await self.llm.ainvoke(prompt + state["messages"])
+        return {"hypothesis": response.content, "revised_this_turn": True}
 
-    async def generate(self, user_input: str) -> str:
-        """Run the agent graph with the given user input
+    async def _assess_node(self, state: AgentState) -> dict:
+        """Judge how close the developer's latest turn came to the hypothesis
 
         Args:
-            user_input: The user's input text
+            state: The current agent state
 
         Returns:
-            The generated output from the LLM
+            The verdict driving the reply
+        """
+        grader = self.llm.with_structured_output(Assessment)
+        instructions = DuxPromptsBase.assess_prompt.format(
+            hypothesis=state["hypothesis"]
+        )
+        assessment = await grader.ainvoke(
+            [SystemMessage(instructions)] + state["messages"]
+        )
+        return {"verdict": assessment.verdict}
+
+    async def _probe_node(self, state: AgentState) -> dict:
+        """Ask the question that moves the developer one step closer
+
+        Args:
+            state: The current agent state
+
+        Returns:
+            The reply to append to the conversation
+        """
+        return await self._reply(state, DuxPromptsBase.probe_prompt)
+
+    async def _affirm_node(self, state: AgentState) -> dict:
+        """Confirm the developer reached the answer and say why it holds
+
+        Args:
+            state: The current agent state
+
+        Returns:
+            The reply to append to the conversation
+        """
+        return await self._reply(state, DuxPromptsBase.affirm_prompt)
+
+    async def _reply(self, state: AgentState, template: str) -> dict:
+        """Generate a reply from a prompt template holding the hypothesis
+
+        Args:
+            state: The current agent state
+            template: The prompt template for this kind of reply
+
+        Returns:
+            The reply to append to the conversation
+        """
+        instructions = template.format(hypothesis=state["hypothesis"])
+        response = await self.llm.ainvoke(
+            [SystemMessage(instructions)] + state["messages"]
+        )
+        return {"messages": [response]}
+
+    async def generate(self, user_input: str, conversation_id: str) -> str:
+        """Run one turn of the conversation
+
+        Args:
+            user_input: The developer's message
+            conversation_id: The thread this message belongs to
+
+        Returns:
+            Dux's reply
         """
         result = await self.graph.ainvoke(
-            {"user_input": user_input, "output": ""}
+            {
+                "messages": [HumanMessage(user_input)],
+                "revised_this_turn": False,
+            },
+            {"configurable": {"thread_id": conversation_id}},
         )
-        return result["output"]
+        return result["messages"][-1].content
