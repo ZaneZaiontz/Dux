@@ -115,3 +115,11 @@ def test_tools_report_refusals_instead_of_raising(project):
 def test_tools_exist_only_when_a_project_is_mounted(tmp_path):
     assert build_workspace_tools(tmp_path / "not_mounted") is None
     assert len(build_workspace_tools(tmp_path)) == 3
+
+
+def test_the_file_cap_can_be_sized_for_the_model(project, tmp_path):
+    (tmp_path / "src" / "big.py").write_text("x = 1\n" * 1000)
+    small = Workspace(tmp_path, max_file_bytes=200)
+
+    assert "truncated" in small.read_file("src/big.py")
+    assert "truncated" not in project.read_file("src/big.py")

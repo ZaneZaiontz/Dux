@@ -1,12 +1,15 @@
 """Tests for the Dux agent"""
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 from langgraph.checkpoint.memory import InMemorySaver
 
-from agents.dux_agent import (MAX_TOOL_CALLS, DuxAgent, route_entry,
-                              route_verdict)
+from agents.dux_agent import (MAX_TOOL_CALLS, DuxAgent, build_model,
+                              route_entry, route_research, route_verdict,
+                              stream_event, supports_tool_calling)
+from agents.endpoint import file_budget, select_loaded_model
 from data.database import connection_string
+from observability import setup_tracing
 from workspace.sandbox import Workspace
 from workspace.tools import build_tools
 
@@ -37,7 +40,7 @@ class StubLLM:
             content=queued
         )
 
-    def with_structured_output(self, schema):
+    def with_structured_output(self, schema, method=None):
         """Return a stub that produces assessments of the given schema"""
         return StubStructured(schema, self.verdicts)
 
@@ -79,6 +82,8 @@ def test_route_entry_hypothesizes_only_when_needed(hypothesis, expected):
     ("arrived", False, "affirm"),
     ("warm", False, "probe"),
     ("off_track", False, "probe"),
+    ("direct_question", True, "answer"),
+    ("direct_question", False, "hypothesize"),
     ("problem_changed", False, "hypothesize"),
     ("problem_changed", True, "probe"),
 ])
@@ -88,6 +93,16 @@ def test_route_verdict_picks_the_reply_and_guards_the_rebuild(
     state = {"verdict": verdict, "revised_this_turn": revised}
 
     assert route_verdict(state) == expected
+
+
+@pytest.mark.parametrize("pending,expected", [
+    (True, "answer"),
+    (False, "assess"),
+])
+def test_finished_research_goes_to_whoever_asked_for_it(pending, expected):
+    state = {"research": [AIMessage(content="done")], "pending_answer": pending}
+
+    assert route_research(state) == expected
 
 
 @pytest.mark.asyncio
@@ -174,3 +189,80 @@ def test_connection_string_uses_the_configured_environment(monkeypatch):
     assert connection_string() == (
         "postgresql://zane:secret@db:5433/dux_test?sslmode=disable"
     )
+
+
+class RefusingLLM(StubLLM):
+    """Model stand-in for a server that rejects tool definitions"""
+
+    def bind_tools(self, _tools):
+        raise ValueError("this model does not support tools")
+
+
+@pytest.mark.asyncio
+async def test_a_tool_capable_model_is_detected(project_tools):
+    assert await supports_tool_calling(StubLLM(["ok"]), project_tools) is True
+
+
+@pytest.mark.asyncio
+async def test_a_model_without_tool_support_is_detected(project_tools):
+    assert await supports_tool_calling(RefusingLLM([]), project_tools) is False
+
+
+def test_the_model_is_configured_from_the_environment(monkeypatch):
+    monkeypatch.setenv("DUX_MODEL", "qwen3-coder")
+    monkeypatch.setenv("DUX_MODEL_BASE_URL", "http://host.docker.internal:1234/v1")
+
+    model = build_model()
+
+    assert model.model_name == "qwen3-coder"
+    assert model.openai_api_base == "http://host.docker.internal:1234/v1"
+
+
+LOADED_LISTING = {
+    "data": [
+        {"id": "some/other-model", "state": "not-loaded",
+         "max_context_length": 4096},
+        {"id": "prism-ml/bonsai-27b", "state": "loaded",
+         "max_context_length": 262144, "loaded_context_length": 100096,
+         "capabilities": ["tool_use"]},
+    ]
+}
+
+
+def test_the_loaded_model_is_picked_out_of_a_listing():
+    found = select_loaded_model(LOADED_LISTING)
+
+    assert found.name == "prism-ml/bonsai-27b"
+    assert found.context_tokens == 100096
+    assert found.supports_tools is True
+
+
+def test_nothing_is_reported_when_no_model_is_loaded():
+    assert select_loaded_model({"data": [{"id": "x", "state": "not-loaded"}]}) is None
+
+
+@pytest.mark.parametrize("context_tokens,expected", [
+    (100096, 100096),
+    (32768, 32768),
+])
+def test_one_file_may_use_a_quarter_of_the_context_window(context_tokens,
+                                                          expected):
+    assert file_budget(context_tokens) == expected
+
+
+def test_tracing_stays_off_when_no_collector_is_configured(monkeypatch):
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+
+    assert setup_tracing() is False
+
+
+@pytest.mark.parametrize("mode,chunk,expected", [
+    ("updates", {"hypothesize": {}}, {"type": "step", "node": "hypothesize"}),
+    ("messages", (AIMessageChunk(content="ask this"),
+                  {"langgraph_node": "probe"}),
+     {"type": "token", "text": "ask this"}),
+    ("messages", (AIMessageChunk(content="the secret answer"),
+                  {"langgraph_node": "hypothesize"}), None),
+])
+def test_only_spoken_nodes_reach_the_client(mode, chunk, expected):
+    assert stream_event(mode, chunk) == expected

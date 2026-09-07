@@ -10,30 +10,37 @@ from workspace.sandbox import Workspace, WorkspaceError
 DEFAULT_WORKSPACE_ROOT = "/workspace"
 
 
-def open_workspace(root: str | None = None) -> Workspace:
+def open_workspace(root: str | None = None,
+                   max_file_bytes: int | None = None) -> Workspace:
     """Open the project directory mounted into the container
 
     Args:
         root: The directory to read, defaulting to the mounted workspace
+        max_file_bytes: The most bytes one file read may return
 
     Returns:
         A workspace rooted at that directory
     """
-    return Workspace(
-        root or os.environ.get("DUX_WORKSPACE_ROOT", DEFAULT_WORKSPACE_ROOT)
-    )
+    directory = root or os.environ.get("DUX_WORKSPACE_ROOT",
+                                       DEFAULT_WORKSPACE_ROOT)
+    if max_file_bytes is None:
+        return Workspace(directory)
+    return Workspace(directory, max_file_bytes=max_file_bytes)
 
 
-def build_workspace_tools(root: str | None = None) -> list[BaseTool] | None:
+def build_workspace_tools(root: str | None = None,
+                          max_file_bytes: int | None = None
+                          ) -> list[BaseTool] | None:
     """Build the code tools when a project is actually mounted
 
     Args:
         root: The directory to read, defaulting to the mounted workspace
+        max_file_bytes: The most bytes one file read may return
 
     Returns:
         The tools, or None when no project directory is present
     """
-    workspace = open_workspace(root)
+    workspace = open_workspace(root, max_file_bytes)
     return build_tools(workspace) if workspace.root.is_dir() else None
 
 
