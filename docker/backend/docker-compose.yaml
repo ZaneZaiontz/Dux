@@ -21,6 +21,8 @@ services:
       - .env
     environment:
       - PYTHONUNBUFFERED=1
+    extra_hosts:
+      - host.docker.internal:host-gateway
     depends_on:
       postgres:
         condition: service_healthy
@@ -49,5 +51,55 @@ services:
       retries: 5
       start_period: 30s
 
+  phoenix:
+    image: arizephoenix/phoenix:20.8.0
+    container_name: dux_phoenix
+    restart: always
+    ports:
+      - ${PHOENIX_PORT:-6006}:6006
+    volumes:
+      - dux_phoenix_data:/mnt/data
+    environment:
+      - PHOENIX_WORKING_DIR=/mnt/data
+
+  tempo:
+    image: grafana/tempo:2.10.8
+    container_name: dux_tempo
+    restart: always
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+      - dux_tempo_data:/var/tempo
+
+  otel_collector:
+    image: otel/opentelemetry-collector-contrib:0.160.0
+    container_name: dux_otel_collector
+    restart: always
+    command: ["--config=/etc/otel-collector.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otel-collector.yaml:ro
+    depends_on:
+      - phoenix
+      - tempo
+
+  grafana:
+    image: grafana/grafana:13.0.8
+    container_name: dux_grafana
+    restart: always
+    ports:
+      - ${GRAFANA_PORT:-3000}:3000
+    volumes:
+      - ./grafana/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      - dux_grafana_data:/var/lib/grafana
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    depends_on:
+      - tempo
+
 volumes:
   dux_postgres_data:
+  dux_phoenix_data:
+  dux_tempo_data:
+  dux_grafana_data:

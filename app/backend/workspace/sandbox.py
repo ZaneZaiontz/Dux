@@ -39,13 +39,16 @@ class WorkspaceError(Exception):
 class Workspace:
     """Read-only view of a project directory with escape and secret guards"""
 
-    def __init__(self, root: Path | str) -> None:
+    def __init__(self, root: Path | str,
+                 max_file_bytes: int = MAX_FILE_BYTES) -> None:
         """Open a workspace rooted at a project directory
 
         Args:
             root: The directory the agent is allowed to read
+            max_file_bytes: The most bytes one file read may return
         """
         self.root = Path(root).resolve()
+        self.max_file_bytes = max_file_bytes
         self.ignored = self._load_gitignore()
 
     def _load_gitignore(self) -> pathspec.PathSpec:
@@ -127,14 +130,14 @@ class Workspace:
                 if end_line is not None and number > end_line:
                     break
                 size += len(line)
-                if size > MAX_FILE_BYTES:
+                if size > self.max_file_bytes:
                     truncated = True
                     break
                 lines.append(line)
 
         text = "".join(lines)
         if truncated:
-            text += f"\n[truncated at {MAX_FILE_BYTES} bytes]"
+            text += f"\n[truncated at {self.max_file_bytes} bytes]"
         return text
 
     def _readable_file(self, relative_path: str) -> Path:

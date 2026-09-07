@@ -5,7 +5,7 @@ from typing import Annotated, Literal, TypedDict
 
 from langchain_core.messages import (AnyMessage, HumanMessage,
                                      RemoveMessage, SystemMessage)
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
 from langgraph.prebuilt import ToolNode
@@ -13,9 +13,13 @@ from pydantic import BaseModel, Field
 
 from prompts.dux_prompts_base import DuxPromptsBase
 
-Verdict = Literal["off_track", "warm", "arrived", "problem_changed"]
+Verdict = Literal["off_track", "warm", "arrived", "direct_question",
+                  "problem_changed"]
 
 MAX_TOOL_CALLS = 8
+DEFAULT_BASE_URL = "http://host.docker.internal:1234/v1"
+DEFAULT_MODEL = "local-model"
+SPOKEN_NODES = ("probe", "affirm", "answer")
 
 
 class Assessment(BaseModel):
@@ -34,6 +38,7 @@ class AgentState(TypedDict):
     verdict: str
     revised_this_turn: bool
     tool_calls_used: int
+    pending_answer: bool
 
 
 def route_entry(state: AgentState) -> str:
@@ -59,6 +64,8 @@ def route_verdict(state: AgentState) -> str:
     """
     if state["verdict"] == "arrived":
         return "affirm"
+    if state["verdict"] == "direct_question":
+        return "answer" if state["revised_this_turn"] else "hypothesize"
     if state["verdict"] == "problem_changed" and not state["revised_this_turn"]:
         return "hypothesize"
     return "probe"
@@ -74,24 +81,78 @@ def route_research(state: AgentState) -> str:
         The name of the node to run next
     """
     latest = state["research"][-1]
-    return "research_tools" if getattr(latest, "tool_calls", None) else "assess"
+    if getattr(latest, "tool_calls", None):
+        return "research_tools"
+    return "answer" if state.get("pending_answer") else "assess"
 
 
-def build_gemini(
-    model_name: str = "gemini-2.5-flash",
-) -> ChatGoogleGenerativeAI:
-    """Build the Gemini chat model used in production
+def stream_event(mode: str, chunk) -> dict | None:
+    """Turn one raw chunk from the graph into an event worth sending on
+
+    Only the nodes that speak to the developer are forwarded, so the private
+    hypothesis and the code read behind it never reach the client.
 
     Args:
-        model_name: The name of the model to use
+        mode: The stream mode the chunk arrived on
+        chunk: The raw chunk from the graph
 
     Returns:
-        A configured Gemini chat model
+        The event to send, or None when the chunk is internal
     """
-    return ChatGoogleGenerativeAI(
-        model=model_name,
-        google_api_key=os.environ.get("GEMINI_KEY"),
+    if mode == "updates":
+        for node in chunk:
+            return {"type": "step", "node": node}
+        return None
+
+    message, metadata = chunk
+    if metadata.get("langgraph_node") not in SPOKEN_NODES:
+        return None
+    if not message.content:
+        return None
+    return {"type": "token", "text": message.content}
+
+
+def build_model(info=None) -> ChatOpenAI:
+    """Build the chat model from the environment
+
+    Any OpenAI compatible endpoint works, local or hosted, so the only
+    difference between a local model and a cloud one is the base URL.
+
+    Args:
+        info: What the endpoint reports it has loaded, when it reports it
+
+    Returns:
+        A configured chat model
+    """
+    discovered = info.name if info else DEFAULT_MODEL
+    return ChatOpenAI(
+        model=os.environ.get("DUX_MODEL") or discovered,
+        base_url=os.environ.get("DUX_MODEL_BASE_URL", DEFAULT_BASE_URL),
+        api_key=os.environ.get("DUX_MODEL_KEY", "local"),
+        temperature=float(os.environ.get("DUX_MODEL_TEMPERATURE", "0.3")),
+        timeout=float(os.environ.get("DUX_MODEL_TIMEOUT", "180")),
     )
+
+
+async def supports_tool_calling(llm, tools) -> bool:
+    """Check whether the configured model accepts tool definitions
+
+    Smaller local models often reject or ignore tools, which would leave Dux
+    guessing about code it never read. Asking once at startup lets the server
+    say so plainly instead of failing quietly.
+
+    Args:
+        llm: The chat model to test
+        tools: The tools Dux wants to bind
+
+    Returns:
+        True when the model accepted a request carrying tool definitions
+    """
+    try:
+        await llm.bind_tools(tools).ainvoke([HumanMessage("ping")])
+        return True
+    except Exception:
+        return False
 
 
 class DuxAgent:
@@ -124,20 +185,26 @@ class DuxAgent:
         graph.add_node("assess", self._assess_node)
         graph.add_node("probe", self._probe_node)
         graph.add_node("affirm", self._affirm_node)
+        graph.add_node("answer", self._answer_node)
         graph.add_conditional_edges(START, route_entry,
                                     ["hypothesize", "assess"])
         if tools:
             graph.add_node("research_tools",
                            ToolNode(tools, messages_key="research"))
-            graph.add_conditional_edges("hypothesize", route_research,
-                                        ["research_tools", "assess"])
+            graph.add_conditional_edges(
+                "hypothesize", route_research,
+                ["research_tools", "assess", "answer"],
+            )
             graph.add_edge("research_tools", "hypothesize")
         else:
             graph.add_edge("hypothesize", "assess")
-        graph.add_conditional_edges("assess", route_verdict,
-                                    ["probe", "affirm", "hypothesize"])
+        graph.add_conditional_edges(
+            "assess", route_verdict,
+            ["probe", "affirm", "answer", "hypothesize"],
+        )
         graph.add_edge("probe", END)
         graph.add_edge("affirm", END)
+        graph.add_edge("answer", END)
         return graph.compile(checkpointer=checkpointer)
 
     async def _hypothesize_node(self, state: AgentState) -> dict:
@@ -173,13 +240,23 @@ class DuxAgent:
         Returns:
             The verdict driving the reply
         """
-        grader = self.llm.with_structured_output(Assessment)
+        grader = self.llm.with_structured_output(
+            Assessment, method="json_schema"
+        )
         instructions = DuxPromptsBase.assess_prompt.format(
             hypothesis=state["hypothesis"]
         )
         assessment = await grader.ainvoke(
             [SystemMessage(instructions)] + state["messages"]
         )
+        if (assessment.verdict == "direct_question"
+                and not state["revised_this_turn"]):
+            return {
+                "verdict": assessment.verdict,
+                "pending_answer": True,
+                "research": [RemoveMessage(id=REMOVE_ALL_MESSAGES)],
+                "tool_calls_used": 0,
+            }
         if assessment.verdict == "problem_changed":
             return {
                 "verdict": assessment.verdict,
@@ -210,6 +287,17 @@ class DuxAgent:
         """
         return await self._reply(state, DuxPromptsBase.affirm_prompt)
 
+    async def _answer_node(self, state: AgentState) -> dict:
+        """Answer a factual question about the code instead of probing
+
+        Args:
+            state: The current agent state
+
+        Returns:
+            The reply to append to the conversation
+        """
+        return await self._reply(state, DuxPromptsBase.answer_prompt)
+
     async def _reply(self, state: AgentState, template: str) -> dict:
         """Generate a reply from a prompt template holding the hypothesis
 
@@ -237,11 +325,43 @@ class DuxAgent:
             Dux's reply
         """
         result = await self.graph.ainvoke(
-            {
-                "messages": [HumanMessage(user_input)],
-                "revised_this_turn": False,
-                "tool_calls_used": 0,
-            },
+            self._turn_input(user_input),
             {"configurable": {"thread_id": conversation_id}},
         )
         return result["messages"][-1].content
+
+    async def stream(self, user_input: str, conversation_id: str):
+        """Run one turn, giving out progress and reply text as they happen
+
+        Args:
+            user_input: The developer's message
+            conversation_id: The thread this message belongs to
+
+        Yields:
+            Events saying which step is running and what Dux is saying
+        """
+        async for mode, chunk in self.graph.astream(
+            self._turn_input(user_input),
+            {"configurable": {"thread_id": conversation_id}},
+            stream_mode=["updates", "messages"],
+        ):
+            event = stream_event(mode, chunk)
+            if event:
+                yield event
+
+    @staticmethod
+    def _turn_input(user_input: str) -> dict:
+        """Build the state a fresh turn starts from
+
+        Args:
+            user_input: The developer's message
+
+        Returns:
+            The input for one run of the graph
+        """
+        return {
+            "messages": [HumanMessage(user_input)],
+            "revised_this_turn": False,
+            "tool_calls_used": 0,
+            "pending_answer": False,
+        }
